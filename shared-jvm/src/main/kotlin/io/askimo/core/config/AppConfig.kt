@@ -660,6 +660,23 @@ data class NotificationsConfig(
     val showDetails: Boolean = false,
 )
 
+/**
+ * Configuration for the inline chat-input autocomplete ("ghost text") feature.
+ * Lives under the `suggestions:` key in askimo.yml.
+ *
+ * History-based suggestions ([io.askimo.core.chat.service.HistoryBackedSuggestionService])
+ * are always on — free, local-only, no AI call — so there's nothing to gate there.
+ *
+ * [aiExtractionEnabled] gates the opt-in AI enhancement: when true, `PhraseHabitRefreshService`
+ * periodically sends a sample of recent messages to the active AI provider — which may be a
+ * cloud service — to learn generalized "typing habit" phrases, served by
+ * [io.askimo.core.chat.service.PersistedPhraseSuggestionService]. Off by default — the only
+ * part of this feature that sends chat content off-device.
+ */
+data class SuggestionsConfig(
+    val aiExtractionEnabled: Boolean = false,
+)
+
 data class AppConfigData(
     val embedding: EmbeddingConfig = EmbeddingConfig(),
     val retry: RetryConfig = RetryConfig(),
@@ -675,6 +692,7 @@ data class AppConfigData(
     val webSearch: WebSearchConfig = WebSearchConfig(),
     val voice: VoiceConfig = VoiceConfig(),
     val notifications: NotificationsConfig = NotificationsConfig(),
+    val suggestions: SuggestionsConfig = SuggestionsConfig(),
     val context: AppContextParams = AppContextParams.noOp(),
     val currentLocale: String? = null,
 )
@@ -762,6 +780,12 @@ object AppConfig {
      * See [NotificationsConfig] for field semantics.
      */
     val notifications: NotificationsConfig get() = delegate.notifications
+
+    /**
+     * Configuration for the inline chat-input autocomplete ("ghost text") feature.
+     * See [SuggestionsConfig] for field semantics.
+     */
+    val suggestions: SuggestionsConfig get() = delegate.suggestions
 
     /**
      * Raw proxy configuration **without** keychain/secure-storage lookup.
@@ -944,6 +968,9 @@ object AppConfig {
             - shimmer
             - verse
 
+        suggestions:
+          ai_extraction_enabled: false
+
         context:
           current_instance_id: ""
           provider_instances: []
@@ -1095,10 +1122,11 @@ object AppConfig {
     /**
      * Generic method to update any config field and persist to YAML file.
      *
-     * Throws if the YAML write fails. [cached] is updated with the new value beforehand
-     * regardless, so callers that ignore the exception still see it in-memory for this session
-     * even though it won't survive a restart. Callers that need a persistence guarantee (e.g.
-     * before deleting a file the old value pointed to) should catch and treat it as a failure.
+     * [cached] is updated with the new value immediately (synchronous, in-memory). The YAML
+     * write to disk is best-effort: failures (e.g. disk full, permissions, a locked file) are
+     * caught and logged here rather than thrown, so callers never need to handle a persistence
+     * exception. In that case the new value remains active for the rest of this process but
+     * won't survive a restart — the previous value will be reloaded from disk instead.
      *
      * @param path Dot-separated path to the field (e.g., "developer.active", "chat.maxRecentMessages")
      * @param value The new value to set
@@ -1114,9 +1142,13 @@ object AppConfig {
                 cached = current.copy(currentLocale = tag)
                 val configPath = resolveOrCreateConfigPath()
                 if (configPath != null && configPath.exists()) {
-                    val updatedYaml = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(cached)
-                    Files.writeString(configPath, updatedYaml)
-                    log.debug("Updated currentLocale=$tag in $configPath")
+                    try {
+                        val updatedYaml = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(cached)
+                        Files.writeString(configPath, updatedYaml)
+                        log.debug("Updated currentLocale=$tag in $configPath")
+                    } catch (e: Exception) {
+                        log.error("Failed to persist currentLocale to config file", e)
+                    }
                 }
                 return
             }
@@ -1162,6 +1194,8 @@ object AppConfig {
 
                 "notifications" -> current.copy(notifications = updateNotificationsField(current.notifications, field, value))
 
+                "suggestions" -> current.copy(suggestions = updateSuggestionsField(current.suggestions, field, value))
+
                 else -> {
                     log.error("Unknown config section: $section", null)
                     return
@@ -1170,9 +1204,13 @@ object AppConfig {
 
             val configPath = resolveOrCreateConfigPath()
             if (configPath != null && configPath.exists()) {
-                val updatedYaml = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(cached)
-                Files.writeString(configPath, updatedYaml)
-                log.debug("Updated {}={} in {}", path, value, configPath)
+                try {
+                    val updatedYaml = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(cached)
+                    Files.writeString(configPath, updatedYaml)
+                    log.debug("Updated {}={} in {}", path, value, configPath)
+                } catch (e: Exception) {
+                    log.error("Failed to persist $path to config file", e)
+                }
             }
         }
     }
@@ -1576,6 +1614,15 @@ object AppConfig {
 
         else -> {
             log.error("Unknown notifications field: $field", null)
+            config
+        }
+    }
+
+    private fun updateSuggestionsField(config: SuggestionsConfig, field: String, value: Any): SuggestionsConfig = when (field) {
+        "aiExtractionEnabled" -> config.copy(aiExtractionEnabled = value as Boolean)
+
+        else -> {
+            log.error("Unknown suggestions field: $field", null)
             config
         }
     }
