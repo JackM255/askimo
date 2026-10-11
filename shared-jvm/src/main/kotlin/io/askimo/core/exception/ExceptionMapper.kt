@@ -80,6 +80,22 @@ object ExceptionMapper {
     }
 
     /**
+     * Returns the message of the deepest exception in the cause chain — the true root cause —
+     * as opposed to `throwable.message`, which may only be a shallow wrapper message (e.g.
+     * `CompletionException("request failed")` wrapping a deeper `IOException` with the actual
+     * detail). [matchByMessage] itself matches against the full joined chain, not just the top
+     * message, so callers that want to know exactly what text drove classification (e.g.
+     * analytics/telemetry) should use this instead of `throwable.message` directly.
+     *
+     * @param throwable The exception to inspect
+     * @return The root cause's message, falling back to [throwable]'s own message, then "unknown"
+     */
+    fun rootCauseMessage(throwable: Throwable): String {
+        val chain = buildExceptionChain(throwable)
+        return chain.last().message ?: throwable.message ?: "unknown"
+    }
+
+    /**
      * Returns true when [message] contains patterns that indicate a local AI server crash
      * (Ollama, Docker AI, LocalAI, LMStudio process dying or failing to load a model).
      */
@@ -88,6 +104,17 @@ object ExceptionMapper {
         message.contains("llama_model_loader", ignoreCase = true) ||
         message.contains("error loading model", ignoreCase = true) ||
         (message.contains("api_error", ignoreCase = true) && message.contains("exit status", ignoreCase = true))
+
+    /**
+     * Captures a model name quoted with backticks, single, or double quotes right after the
+     * word "model" — matches OpenAI-style messages like:
+     *   "The model `davinci-002` does not exist or you do not have access to it."
+     *   "The model 'gpt-5-turbo' does not exist"
+     */
+    private val MODEL_NAME_PATTERN = Regex("""model[\s:]*[`'"]([^`'"]+)[`'"]""", RegexOption.IGNORE_CASE)
+
+    /** Best-effort extraction of the offending model name from a provider error message. */
+    private fun extractModelName(message: String): String = MODEL_NAME_PATTERN.find(message)?.groupValues?.get(1) ?: ""
 
     /**
      * Try to match an exception by its concrete type.
@@ -121,7 +148,7 @@ object ExceptionMapper {
         is InternalServerException -> {
             val msg = exception.message ?: ""
             if (isLocalServerMessage(msg)) {
-                LocalServerException(details = msg, cause = exception)
+                LocalServerException(details = msg.take(300), cause = exception)
             } else {
                 RemoteServerException(details = msg, cause = exception)
             }
@@ -195,7 +222,7 @@ object ExceptionMapper {
                 combinedMessage.contains("invalid model", ignoreCase = true) ||
                 combinedMessage.contains("does not exist", ignoreCase = true) ->
                 ModelNotFoundChatException(
-                    model = "",
+                    model = extractModelName(combinedMessage),
                     cause = rootCause,
                 )
 
@@ -248,6 +275,19 @@ object ExceptionMapper {
                         combinedMessage.contains("must not be blank", ignoreCase = true)
                     ) ->
                 MalformedToolCallException(cause = rootCause)
+
+            // Model doesn't support multimodal (image/file) input — common with OpenAI-compatible
+            // local/self-hosted servers (LM Studio, LocalAI, vLLM, etc.) when the user attaches an
+            // image/file to a text-only model. Checked before the generic 400 bucket. Own message
+            // key keeps the translated guidance sentence out of every locale; details carries the
+            // raw provider message as-is (no authored per-provider copy).
+            combinedMessage.contains("multimodal", ignoreCase = true) &&
+                (
+                    combinedMessage.contains("does not support", ignoreCase = true) ||
+                        combinedMessage.contains("not support", ignoreCase = true) ||
+                        combinedMessage.contains("unsupported", ignoreCase = true)
+                    ) ->
+                MultimodalNotSupportedException(details = combinedMessage.take(300), cause = rootCause)
 
             // Invalid request
             combinedMessage.contains("400", ignoreCase = true) ||
