@@ -8,12 +8,29 @@ import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.net.ConnectException
 import java.net.URI
+import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.HttpConnectTimeoutException
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.zip.GZIPInputStream
+
+/**
+ * Percent-encodes each `/`-separated segment of a URL path (e.g. a server-provided file path
+ * being spliced into a `resolve/.../<path>`-style URL), so segments containing spaces or
+ * reserved characters (`#`, `?`, `%`, etc.) don't break [URI] parsing or get misinterpreted as
+ * part of the URL's structure (e.g. a literal `#` starting a fragment). [URLEncoder] encodes for
+ * query-string/form use (e.g. turns spaces into `+`, which is wrong in a path segment), so each
+ * segment is encoded with it and then `+` is corrected back to `%20`.
+ *
+ * Use this instead of splicing a raw path into a URL string directly whenever that path
+ * originates from an external source (API response, user input) rather than a fixed literal.
+ */
+fun encodeUrlPathSegments(path: String): String = path.split("/").joinToString("/") { segment ->
+    URLEncoder.encode(segment, StandardCharsets.UTF_8).replace("+", "%20")
+}
 
 /**
  * Perform a GET request to a local/remote URL with proxy support.
@@ -26,15 +43,7 @@ fun httpGet(
     readTimeoutMs: Long = 8_000,
     httpVersion: HttpClient.Version = HttpClient.Version.HTTP_2,
 ): Pair<Int, String> {
-    val client = ProxyUtil.configureProxy(HttpClient.newBuilder().version(httpVersion), url)
-        .connectTimeout(Duration.ofMillis(connectTimeoutMs))
-        .build()
-    val requestBuilder = HttpRequest.newBuilder()
-        .uri(URI(url))
-        .timeout(Duration.ofMillis(readTimeoutMs))
-        .GET()
-    headers.forEach { (k, v) -> requestBuilder.header(k, v) }
-    val response = client.sendWithErrorHandling(requestBuilder.build(), url)
+    val response = sendRequest(url, headers, connectTimeoutMs, readTimeoutMs, httpVersion) { GET() }
     val decompressedBody = decompressGzipIfNeeded(response.body(), response)
     return response.statusCode() to decompressedBody
 }
@@ -51,16 +60,7 @@ fun httpPost(
     readTimeoutMs: Long = 600_000,
     httpVersion: HttpClient.Version = HttpClient.Version.HTTP_2,
 ): Pair<Int, String> {
-    val client = ProxyUtil.configureProxy(HttpClient.newBuilder().version(httpVersion), url)
-        .connectTimeout(Duration.ofMillis(connectTimeoutMs))
-        .build()
-    val requestBuilder = HttpRequest.newBuilder()
-        .uri(URI(url))
-        .timeout(Duration.ofMillis(readTimeoutMs))
-        .header("Content-Type", "application/json")
-        .POST(HttpRequest.BodyPublishers.ofString(body))
-    headers.forEach { (k, v) -> requestBuilder.header(k, v) }
-    val response = client.sendWithErrorHandling(requestBuilder.build(), url)
+    val response = sendJsonPost(url, body, headers, connectTimeoutMs, readTimeoutMs, httpVersion)
     val decompressedBody = decompressGzipIfNeeded(response.body(), response)
     return response.statusCode() to decompressedBody
 }
@@ -78,18 +78,45 @@ fun httpPostForBytes(
     readTimeoutMs: Long = 600_000,
     httpVersion: HttpClient.Version = HttpClient.Version.HTTP_2,
 ): Pair<Int, ByteArray> {
+    val response = sendJsonPost(url, body, headers, connectTimeoutMs, readTimeoutMs, httpVersion)
+    val decompressedBody = decompressGzipBytesIfNeeded(response.body(), response)
+    return response.statusCode() to decompressedBody
+}
+
+private fun sendJsonPost(
+    url: String,
+    body: String,
+    headers: Map<String, String>,
+    connectTimeoutMs: Long,
+    readTimeoutMs: Long,
+    httpVersion: HttpClient.Version,
+): HttpResponse<ByteArray> = sendRequest(url, headers, connectTimeoutMs, readTimeoutMs, httpVersion) {
+    header("Content-Type", "application/json")
+    POST(HttpRequest.BodyPublishers.ofString(body))
+}
+
+/**
+ * Builds a proxy-aware [HttpClient] + [HttpRequest] for [url] and sends it, wrapping connection
+ * errors — shared by [httpGet]/[httpPost]/[httpPostForBytes] which otherwise only differ in the
+ * HTTP method/body via [configureRequest].
+ */
+private fun sendRequest(
+    url: String,
+    headers: Map<String, String>,
+    connectTimeoutMs: Long,
+    readTimeoutMs: Long,
+    httpVersion: HttpClient.Version,
+    configureRequest: HttpRequest.Builder.() -> Unit,
+): HttpResponse<ByteArray> {
     val client = ProxyUtil.configureProxy(HttpClient.newBuilder().version(httpVersion), url)
         .connectTimeout(Duration.ofMillis(connectTimeoutMs))
         .build()
     val requestBuilder = HttpRequest.newBuilder()
         .uri(URI(url))
         .timeout(Duration.ofMillis(readTimeoutMs))
-        .header("Content-Type", "application/json")
-        .POST(HttpRequest.BodyPublishers.ofString(body))
+    requestBuilder.configureRequest()
     headers.forEach { (k, v) -> requestBuilder.header(k, v) }
-    val response = client.sendWithErrorHandling(requestBuilder.build(), url)
-    val decompressedBody = decompressGzipBytesIfNeeded(response.body(), response)
-    return response.statusCode() to decompressedBody
+    return client.sendWithErrorHandling(requestBuilder.build(), url)
 }
 
 /**

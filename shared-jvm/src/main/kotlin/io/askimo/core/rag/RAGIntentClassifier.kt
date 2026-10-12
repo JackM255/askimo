@@ -56,17 +56,56 @@ class RAGIntentClassifier(
             classifierChatClient.sendMessage(prompt)
         }
 
-        val intent = when (response.trim().uppercase()) {
-            "RAG" -> RAGIntent.RAG
-            "SEARCH" -> RAGIntent.SEARCH
-            else -> RAGIntent.SKIP
-        }
+        val intent = parseIntent(response)
 
         log.debug("RAG Classification: $intent (response: $response)")
         intent
     } catch (e: Exception) {
         log.warn("Intent classification failed: ${e.message}. Defaulting to RAG", e)
         RAGIntent.RAG
+    }
+
+    /**
+     * Parses the classifier model's raw response into a [RAGIntent], tolerating the kind of
+     * chatty/non-compliant output smaller local models (e.g. via `llama-server`) tend to produce
+     * instead of the requested single word — e.g. "I'll classify this as RAG because..." or
+     * "**SEARCH**". Falls back to [RAGIntent.RAG] (the safest option — it still runs the real
+     * hybrid retriever) when no intent keyword can be found at all, rather than silently
+     * skipping retrieval or misrouting to a raw grep dump.
+     */
+    private fun parseIntent(response: String): RAGIntent {
+        val normalized = response.trim().uppercase()
+
+        // Fast path: exact match (what well-behaved models return).
+        when (normalized) {
+            "RAG" -> return RAGIntent.RAG
+            "SEARCH" -> return RAGIntent.SEARCH
+            "SKIP" -> return RAGIntent.SKIP
+        }
+
+        // Fallback: find every standalone keyword occurrence (handles "**SEARCH**",
+        // "Intent: RAG.", markdown, trailing punctuation, etc.). Only accept it when exactly
+        // one *distinct* keyword appears — taking the first match would misclassify responses
+        // that restate all options before answering (e.g. "Options: RAG, SEARCH, SKIP. Answer:
+        // SEARCH" would wrongly resolve to RAG).
+        val matches = Regex("""\b(RAG|SEARCH|SKIP)\b""").findAll(normalized)
+            .map { it.groupValues[1] }
+            .distinct()
+            .toList()
+        val match = matches.singleOrNull()
+
+        return when (match) {
+            "RAG" -> RAGIntent.RAG
+
+            "SEARCH" -> RAGIntent.SEARCH
+
+            "SKIP" -> RAGIntent.SKIP
+
+            else -> {
+                log.warn("Could not parse RAG intent from classifier response, defaulting to RAG: $response")
+                RAGIntent.RAG
+            }
+        }
     }
 
     private fun buildPrompt(

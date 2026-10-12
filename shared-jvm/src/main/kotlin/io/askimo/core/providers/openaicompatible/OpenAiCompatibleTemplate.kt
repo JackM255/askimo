@@ -5,6 +5,7 @@
 package io.askimo.core.providers.openaicompatible
 
 import io.askimo.core.providers.HttpVersion
+import io.askimo.core.providers.llama.LlamaServerProcessManager
 import io.askimo.core.util.appJson
 import io.askimo.core.util.httpGet
 import kotlinx.serialization.json.contentOrNull
@@ -204,6 +205,34 @@ enum class OpenAiCompatibleTemplate(
         apiKeyUrl = "",
         helpTextKey = "provider.template.ollama.help",
         apiMode = OpenAiApiMode.RESPONSES,
+        httpVersion = HttpVersion.HTTP_1_1,
+    ),
+
+    /**
+     * Askimo's built-in local LLM — no external server (Ollama, LM Studio) required.
+     *
+     * Unlike every other entry here, [baseUrl] is a placeholder, not a connectable address.
+     * [LlamaServerProcessManager] binds its reverse proxy to a fresh free port each app launch,
+     * so the real connection always resolves the *live* [LlamaServerProcessManager.proxyBaseUrl]
+     * lazily in [OpenAiCompatibleModelFactory.effectiveBaseUrl] instead. Reading `proxyBaseUrl`
+     * here directly would start the local HTTP listener just from touching
+     * [OpenAiCompatibleTemplate.entries] (e.g. opening the provider picker), since every enum
+     * constant is evaluated eagerly — even if the user never selects the local LLM.
+     *
+     * [apiKeyRequired] is `false` — the proxy accepts any/no key. Gating on whether the
+     * `llama-server` binary and at least one `.gguf` model have been downloaded yet is the
+     * Settings UI's responsibility (see `io.askimo.core.providers.llama.LlamaServerDownloader`
+     * and `io.askimo.core.providers.llama.LlamaModelDownloader`), not this template's.
+     */
+    ASKIMO_LOCAL_LLM(
+        displayName = "Local LLM (built-in)",
+        initials = "AI",
+        taglineKey = "provider.template.askimo_local_llm.tagline",
+        baseUrl = "http://127.0.0.1/v1",
+        apiKeyRequired = false,
+        apiKeyUrl = "",
+        helpTextKey = "provider.template.askimo_local_llm.help",
+        apiMode = OpenAiApiMode.CHAT_COMPLETIONS,
         httpVersion = HttpVersion.HTTP_1_1,
     ),
 }

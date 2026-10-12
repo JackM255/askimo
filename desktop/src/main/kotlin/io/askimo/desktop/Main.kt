@@ -79,6 +79,7 @@ import io.askimo.core.logging.LoggingService
 import io.askimo.core.logging.currentFileLogger
 import io.askimo.core.mcp.McpInstanceService
 import io.askimo.core.providers.ModelProvider
+import io.askimo.core.providers.llama.LlamaServerProcessManager
 import io.askimo.core.user.domain.UserProfile
 import io.askimo.core.util.AskimoHome
 import io.askimo.core.util.PersonalAskimoHome
@@ -198,7 +199,6 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
-import kotlin.system.exitProcess
 import kotlin.time.Clock
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -294,30 +294,49 @@ fun main(args: Array<String>) {
 
         // Load saved window state or use defaults (persisted automatically via rememberPersistedWindowState)
         val windowState = rememberPersistedWindowState()
+        val exitScope = rememberCoroutineScope()
+
+        // Single source of truth for "what happens when Askimo quits" — used by both the
+        // window close button (onCloseRequest) and the in-app Quit confirmation dialog
+        val performExit: () -> Unit = {
+            val messageCount = runCatching {
+                val t = AppContext.getInstance().telemetry
+                t.usageRepository.countByPeriod(t.sessionStart, Clock.System.now())
+            }.getOrDefault(0)
+            Analytics.trackSessionEnd(messageCount)
+            Analytics.shutdown()
+            // Stops the reverse-proxy HTTP listener and kills any resident llama-server child
+            // process(es) — without this, quitting left llama-server running as an orphaned
+            // process. Uses the suspend stopProxy() on a background dispatcher, not the blocking
+            // LlamaServerProcessManager.shutdown() — this callback runs on the Compose UI
+            // dispatcher, which a suspended loadModel() health-check may need to resume on to
+            // release its slot mutex; blocking it here would deadlock app quit.
+            exitScope.launch(Dispatchers.IO) {
+                try {
+                    LlamaServerProcessManager.stopProxy()
+                } catch (e: Exception) {
+                    log.warn("stopProxy() failed while quitting; exiting anyway", e)
+                } finally {
+                    withContext(Dispatchers.Main) { exitApplication() }
+                }
+            }
+        }
 
         Window(
             icon = icon,
-            onCloseRequest = {
-                val messageCount = runCatching {
-                    val t = AppContext.getInstance().telemetry
-                    t.usageRepository.countByPeriod(t.sessionStart, Clock.System.now())
-                }.getOrDefault(0)
-                Analytics.trackSessionEnd(messageCount)
-                Analytics.shutdown()
-                exitApplication()
-            },
+            onCloseRequest = performExit,
             title = "Askimo",
             state = windowState,
             undecorated = isScreenshotMode,
         ) {
-            app(frameWindowScope = this@Window, windowState = windowState)
+            app(frameWindowScope = this@Window, windowState = windowState, onQuit = performExit)
         }
     }
 }
 
 @Composable
 @Preview
-fun app(frameWindowScope: FrameWindowScope? = null, windowState: WindowState? = null) {
+fun app(frameWindowScope: FrameWindowScope? = null, windowState: WindowState? = null, onQuit: () -> Unit = {}) {
     var isReady by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { isReady = true }
 
@@ -1363,7 +1382,7 @@ fun app(frameWindowScope: FrameWindowScope? = null, windowState: WindowState? = 
                                 dangerButton(
                                     onClick = {
                                         showQuitDialog = false
-                                        exitProcess(0)
+                                        onQuit()
                                     },
                                 ) {
                                     Text(stringResource("action.yes"))
